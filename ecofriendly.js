@@ -298,115 +298,122 @@ app.delete('/cart/:id', (req, res) => {
   });
 });
 
-// POST /checkout – Process a user's checkout and store shipping address
+// POST /checkout – Process a user's checkout and store shipping address 
+// POST /checkout – Process a user's checkout and store shipping address 
 app.post('/checkout', async (req, res) => {
-  const { user_id, shipping_address } = req.body;  
-  // Make sure user_id and shipping_address are provided (or shipping_address is optional)
+  // 1) Destructure the nested shipping_address
+  const { user_id, shipping_address } = req.body;
+  // Make sure we have something to unpack
+  const {
+    fullName,
+    address1,
+    address2 = null,
+    town,
+    postcode,
+    country = 'United Kingdom'
+  } = shipping_address || {};
+
+  // 2) Validate required fields
   if (!user_id) {
     return res.status(400).json({ status: 400, message: "User ID is required" });
   }
+  if (!fullName || !address1 || !town || !postcode) {
+    return res.status(400).json({ status: 400, message: "Incomplete shipping address" });
+  }
 
-  // Promisify transaction helpers using the connection from your MySQL pool
-  const beginTrans = () => {
-    return new Promise((resolve, reject) => {
-      db.getConnection((err, connection) => {
-        if (err) return reject(err);
-        connection.beginTransaction((err) => {
-          if (err) {
-            connection.release();
-            return reject(err);
-          }
-          resolve(connection);
-        });
+  // 3) Transaction helpers (same as before)
+  const beginTrans = () => new Promise((resolve, reject) => {
+    db.getConnection((err, conn) => {
+      if (err) return reject(err);
+      conn.beginTransaction(err => {
+        if (err) { conn.release(); return reject(err); }
+        resolve(conn);
       });
     });
-  };
-
-  const commitTrans = (connection) => {
-    return new Promise((resolve, reject) => {
-      connection.commit((err) => {
-        if (err) {
-          connection.rollback(() => {
-            connection.release();
-            reject(err);
-          });
-        } else {
-          connection.release();
-          resolve();
-        }
-      });
-    });
-  };
-
-  const rollbackTrans = (connection) => {
-    return new Promise((resolve) => {
-      connection.rollback(() => {
-        connection.release();
+  });
+  const commitTrans = conn => new Promise((resolve, reject) => {
+    conn.commit(err => {
+      if (err) {
+        conn.rollback(() => { conn.release(); reject(err); });
+      } else {
+        conn.release();
         resolve();
-      });
+      }
     });
-  };
-
-  const queryPromise = (connection, query, params = []) => {
-    return new Promise((resolve, reject) => {
-      connection.query(query, params, (err, results) => {
-        if (err) return reject(err);
-        resolve(results);
-      });
+  });
+  const rollbackTrans = conn => new Promise(resolve => {
+    conn.rollback(() => { conn.release(); resolve(); });
+  });
+  const queryP = (conn, sql, params=[]) => new Promise((resolve, reject) => {
+    conn.query(sql, params, (err, results) => {
+      if (err) return reject(err);
+      resolve(results);
     });
-  };
+  });
 
-  let connection;
+  let conn;
   try {
-    // Begin transaction
-    connection = await beginTrans();
+    conn = await beginTrans();
 
-    // 1. Fetch cart items for the user
-    const cartQuery = `
+    // 4) Fetch cart items
+    const cartSQL = `
       SELECT c.cart_id, c.product_id, c.quantity, p.price
       FROM cart c
-      LEFT JOIN products p ON c.product_id = p.product_id
+      JOIN products p ON c.product_id = p.product_id
       WHERE c.user_id = ?
     `;
-    const cartItems = await queryPromise(connection, cartQuery, [user_id]);
+    const cartItems = await queryP(conn, cartSQL, [user_id]);
     if (cartItems.length === 0) {
-      await rollbackTrans(connection);
+      await rollbackTrans(conn);
       return res.status(400).json({ status: 400, message: "Your cart is empty" });
     }
 
-    // 2. Calculate the total cost
-    const totalCost = cartItems.reduce((total, item) => total + item.price * item.quantity, 0);
+    // 5) Calculate total
+    const totalCost = cartItems.reduce((sum, it) => sum + it.price * it.quantity, 0);
 
-    // 3. Insert a new order in the orders table including shipping_address
-    const orderQuery = `
-      INSERT INTO orders (user_id, order_date, total_cost, shipping_address)
-      VALUES (?, CURDATE(), ?, ?)
+    // 6) Insert into orders with the discrete shipping columns
+    const orderSQL = `
+      INSERT INTO orders
+        (user_id, order_date, total_cost,
+         shipping_full_name,
+         shipping_address_1,
+         shipping_address_2,
+         shipping_town,
+         shipping_postcode,
+         shipping_country)
+      VALUES (?, CURDATE(), ?, ?, ?, ?, ?, ?, ?)
     `;
-    const orderResult = await queryPromise(connection, orderQuery, [user_id, totalCost, shipping_address]);
-    const orderId = orderResult.insertId;
+    const orderRes = await queryP(conn, orderSQL, [
+      user_id,
+      totalCost,
+      fullName,
+      address1,
+      address2,
+      town,
+      postcode,
+      country
+    ]);
+    const orderId = orderRes.insertId;
 
-    // 4. Insert order details for each cart item
-    const orderDetailsValues = cartItems.map(item => [item.product_id, orderId]);
-    const orderDetailsQuery = `
-      INSERT INTO order_details (product_id, order_id)
-      VALUES ?
-    `;
-    await queryPromise(connection, orderDetailsQuery, [orderDetailsValues]);
+    // 7) Insert order_details
+    const detailValues = cartItems.map(item => [item.product_id, orderId]);
+    await queryP(conn, `INSERT INTO order_details (product_id, order_id) VALUES ?`, [detailValues]);
 
-    // 5. Clear the user's cart
-    const clearCartQuery = `DELETE FROM cart WHERE user_id = ?`;
-    await queryPromise(connection, clearCartQuery, [user_id]);
+    // 8) Clear the cart
+    await queryP(conn, `DELETE FROM cart WHERE user_id = ?`, [user_id]);
 
-    // 6. Commit the transaction
-    await commitTrans(connection);
-    
+    // 9) Commit
+    await commitTrans(conn);
+
     res.status(200).json({ status: 200, message: "Checkout successful", order_id: orderId });
-  } catch (error) {
-    console.error("Error during checkout:", error);
-    if (connection) await rollbackTrans(connection);
-    res.status(500).json({ status: 500, message: "Checkout failed", error });
+  } catch (err) {
+    console.error("Checkout error:", err);
+    if (conn) await rollbackTrans(conn);
+    res.status(500).json({ status: 500, message: "Checkout failed", error: err.message });
   }
 });
+
+
 // GET endpoint: Fetch all orders joined with user details for admin view
 app.get('/admin/orders', (req, res) => {
   const sql = `
