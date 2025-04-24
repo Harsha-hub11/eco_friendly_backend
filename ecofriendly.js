@@ -299,19 +299,15 @@ app.delete('/cart/:id', (req, res) => {
 });
 
 // POST /checkout – Process a user's checkout and store shipping address 
-// POST /checkout – Process a user's checkout and store shipping address 
 app.post('/checkout', async (req, res) => {
-  // 1) Destructure the nested shipping_address
-  const { user_id, shipping_address } = req.body;
-  // Make sure we have something to unpack
+  // 1) Destructure user, address and card payload
+  const { user_id, shipping_address, payment } = req.body;
   const {
-    fullName,
-    address1,
-    address2 = null,
-    town,
-    postcode,
-    country = 'United Kingdom'
+    fullName, address1, address2=null, town, postcode, country='United Kingdom'
   } = shipping_address || {};
+  const {
+    cardType, cardHolderName, cardNumber, expiryMonth, expiryYear, paymentToken=null
+  } = payment || {};
 
   // 2) Validate required fields
   if (!user_id) {
@@ -320,8 +316,14 @@ app.post('/checkout', async (req, res) => {
   if (!fullName || !address1 || !town || !postcode) {
     return res.status(400).json({ status: 400, message: "Incomplete shipping address" });
   }
+  if (!cardType || !cardHolderName || !cardNumber || !expiryMonth || !expiryYear) {
+    return res.status(400).json({ status: 400, message: "Incomplete payment details" });
+  }
 
-  // 3) Transaction helpers (same as before)
+  // 3) Derive safe card parts
+  const cardLast4 = cardNumber.slice(-4);
+
+  // 4) Transaction helpers (same as before) …
   const beginTrans = () => new Promise((resolve, reject) => {
     db.getConnection((err, conn) => {
       if (err) return reject(err);
@@ -355,7 +357,7 @@ app.post('/checkout', async (req, res) => {
   try {
     conn = await beginTrans();
 
-    // 4) Fetch cart items
+    // 5) Fetch cart items …
     const cartSQL = `
       SELECT c.cart_id, c.product_id, c.quantity, p.price
       FROM cart c
@@ -368,41 +370,35 @@ app.post('/checkout', async (req, res) => {
       return res.status(400).json({ status: 400, message: "Your cart is empty" });
     }
 
-    // 5) Calculate total
+    // 6) Calculate total cost
     const totalCost = cartItems.reduce((sum, it) => sum + it.price * it.quantity, 0);
 
-    // 6) Insert into orders with the discrete shipping columns
+    // 7) Insert into orders with shipping + payment columns
     const orderSQL = `
       INSERT INTO orders
         (user_id, order_date, total_cost,
-         shipping_full_name,
-         shipping_address_1,
-         shipping_address_2,
-         shipping_town,
-         shipping_postcode,
-         shipping_country)
-      VALUES (?, CURDATE(), ?, ?, ?, ?, ?, ?, ?)
+         shipping_full_name, shipping_address_1, shipping_address_2,
+         shipping_town, shipping_postcode, shipping_country,
+         card_type, card_holder_name, card_last4, card_expiry_month,
+         card_expiry_year, payment_token)
+      VALUES (?, CURDATE(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
     const orderRes = await queryP(conn, orderSQL, [
       user_id,
       totalCost,
-      fullName,
-      address1,
-      address2,
-      town,
-      postcode,
-      country
+      fullName, address1, address2, town, postcode, country,
+      cardType, cardHolderName, cardLast4, expiryMonth, expiryYear, paymentToken
     ]);
     const orderId = orderRes.insertId;
 
-    // 7) Insert order_details
-    const detailValues = cartItems.map(item => [item.product_id, orderId]);
-    await queryP(conn, `INSERT INTO order_details (product_id, order_id) VALUES ?`, [detailValues]);
+    // 8) Insert order_details …
+    const detailVals = cartItems.map(it => [it.product_id, orderId]);
+    await queryP(conn, `INSERT INTO order_details (product_id, order_id) VALUES ?`, [detailVals]);
 
-    // 8) Clear the cart
+    // 9) Clear cart …
     await queryP(conn, `DELETE FROM cart WHERE user_id = ?`, [user_id]);
 
-    // 9) Commit
+    // 10) Commit
     await commitTrans(conn);
 
     res.status(200).json({ status: 200, message: "Checkout successful", order_id: orderId });
@@ -413,23 +409,6 @@ app.post('/checkout', async (req, res) => {
   }
 });
 
-
-// GET endpoint: Fetch all orders joined with user details for admin view
-app.get('/admin/orders', (req, res) => {
-  const sql = `
-    SELECT o.order_id, o.user_id, u.user_name, o.order_date, o.total_cost, o.created_at 
-    FROM orders o 
-    LEFT JOIN user u ON o.user_id = u.user_id
-    ORDER BY o.order_date DESC
-  `;
-  db.query(sql, (err, results) => {
-    if (err) {
-      console.error('Error fetching orders:', err);
-      return res.status(500).json({ status: 500, message: 'Failed to fetch orders' });
-    }
-    res.status(200).json({ status: 200, data: results });
-  });
-});
 
 // GET endpoint: Fetch order details (products, quantities, etc.) for a given order_id
 app.get('/admin/orders/:id', (req, res) => {
